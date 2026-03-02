@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
+	"strings"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -16,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	dscv1 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v1"
+	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
 	webhookutils "github.com/opendatahub-io/opendatahub-operator/v2/pkg/webhook"
 )
@@ -75,7 +78,7 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 	case admissionv1.Create:
 		return validate(ctx, []validationCheck{v.denyKueueManagedState, denyMultipleDsc}, allowMessage, v.Client, &req)
 	case admissionv1.Update:
-		return validate(ctx, []validationCheck{v.denyKueueManagedState}, allowMessage, v.Client, &req)
+		return validate(ctx, []validationCheck{v.denyKueueManagedState, v.denyV1PatchWhenV2ComponentsManaged}, allowMessage, v.Client, &req)
 	default:
 		return admission.Allowed(allowMessage)
 	}
@@ -109,4 +112,95 @@ func (v *Validator) denyKueueManagedState(ctx context.Context, _ client.Reader, 
 	}
 
 	return admission.Allowed("")
+}
+
+// denyV1PatchWhenV2ComponentsManaged prevents v1 API updates when v2-only components are Managed.
+// This prevents data loss that would occur when v1 API (which doesn't have v2-only component fields)
+// is used to update a DSC that has v2-only components set to Managed.
+// During v1→v2 conversion, v2-only fields get default values (Removed), causing silent data loss.
+func (v *Validator) denyV1PatchWhenV2ComponentsManaged(ctx context.Context, cli client.Reader, req *admission.Request) admission.Response {
+	// Fetch the current DSC from cluster (stored as v2)
+	currentDSC := &dscv2.DataScienceCluster{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: req.Name}, currentDSC); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to get current DataScienceCluster for v2 component check")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// Check if any v2-only components are Managed
+	v2OnlyComponents, err := getV2OnlyManagedComponents(currentDSC)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to inspect v2-only component states")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	if len(v2OnlyComponents) > 0 {
+		return admission.Denied(
+			"This DataScienceCluster uses v2 components. You must always use the v2 API to modify it.",
+		)
+	}
+
+	return admission.Allowed("")
+}
+
+// getV2OnlyManagedComponents dynamically finds components that exist in v2 but not v1,
+// and returns those that are currently Managed.
+// This uses reflection to automatically detect v2-only components without hardcoding,
+// making it future-proof when new v2-only components are added.
+func getV2OnlyManagedComponents(dsc *dscv2.DataScienceCluster) ([]string, error) {
+	managed := []string{}
+
+	// Map of v2 field names that were renamed from v1
+	// Key: v2 field name, Value: v1 field name
+	renamedFields := map[string]string{
+		"AIPipelines": "DataSciencePipelines", // v2's AIPipelines = v1's DataSciencePipelines
+	}
+
+	// Build a map of v1 component field names for comparison
+	v1ComponentsType := reflect.TypeOf(dscv1.Components{})
+	v1FieldNames := make(map[string]bool)
+	for i := range v1ComponentsType.NumField() {
+		v1FieldNames[v1ComponentsType.Field(i).Name] = true
+	}
+
+	// Examine v2 components to find v2-only ones
+	v2ComponentsType := reflect.TypeOf(dsc.Spec.Components)
+	v2ComponentsValue := reflect.ValueOf(dsc.Spec.Components)
+
+	for i := range v2ComponentsType.NumField() {
+		field := v2ComponentsType.Field(i)
+		fieldName := field.Name
+
+		// Skip if this component exists in v1 (not v2-only)
+		if v1FieldNames[fieldName] {
+			continue
+		}
+
+		// Check if this v2 field has a different name in v1 (renamed component)
+		if v1EquivalentName, isRenamed := renamedFields[fieldName]; isRenamed {
+			if v1FieldNames[v1EquivalentName] {
+				continue // Component exists in v1 under a different name
+			}
+		}
+
+		// This is a v2-only component - check if it's Managed
+		componentValue := v2ComponentsValue.Field(i)
+
+		// Get the ManagementState field using reflection
+		managementStateField := componentValue.FieldByName("ManagementState")
+		if !managementStateField.IsValid() {
+			return nil, fmt.Errorf("unsupported v2 component layout for %s", field.Name)
+		}
+
+		// Check if ManagementState == Managed
+		if managementStateField.Interface() == operatorv1.Managed {
+			// Extract component name from JSON tag (e.g., `json:"trainer,omitempty"`)
+			jsonTag := field.Tag.Get("json")
+			componentName := strings.Split(jsonTag, ",")[0]
+			if componentName != "" && componentName != "-" {
+				managed = append(managed, componentName)
+			}
+		}
+	}
+
+	return managed, nil
 }
