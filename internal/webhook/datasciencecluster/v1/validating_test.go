@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	dscv1 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v1"
+	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
 	v1webhook "github.com/opendatahub-io/opendatahub-operator/v2/internal/webhook/datasciencecluster/v1"
 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/webhook/envtestutil"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
@@ -52,7 +53,7 @@ func TestDataScienceClusterV1_ValidatingWebhook(t *testing.T) {
 		},
 		{
 			name:         "Denies creation if one already exists",
-			existingObjs: []client.Object{envtestutil.NewDSCV1("existing")},
+			existingObjs: []client.Object{envtestutil.NewDSC("existing")},
 			req:          envtestutil.NewAdmissionRequest(t, admissionv1.Create, envtestutil.NewDSCV1("test-create"), gvk.DataScienceClusterV1, gvr),
 			allowed:      false,
 		},
@@ -98,6 +99,130 @@ func TestDataScienceClusterV1_ValidatingWebhook(t *testing.T) {
 			name:    "Allows delete with Kueue Managed",
 			req:     envtestutil.NewAdmissionRequest(t, admissionv1.Delete, envtestutil.NewDSCV1("test", withKueueState(operatorv1.Managed)), gvk.DataScienceClusterV1, gvr),
 			allowed: true,
+		},
+
+		// V2-only component protection cases
+		{
+			name: "Allows v1 update when no v2-only components are Managed",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Removed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: true,
+		},
+		{
+			name: "Allows v1 update when AIPipelines is Managed (v1 equivalent component)",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.AIPipelines.ManagementState = operatorv1.Managed
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Removed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: true,
+		},
+		{
+			name: "Denies v1 update when Trainer is Managed",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Managed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Removed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: false,
+		},
+		{
+			name: "Denies v1 update when MLflowOperator is Managed",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Managed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Removed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: false,
+		},
+		{
+			name: "Denies v1 update when SparkOperator is Managed",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Removed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Managed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: false,
+		},
+		{
+			name: "Denies v1 update when multiple v2-only components are Managed",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("test-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Managed
+					dsc.Spec.Components.MLflowOperator.ManagementState = operatorv1.Managed
+					dsc.Spec.Components.SparkOperator.ManagementState = operatorv1.Managed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: false,
+		},
+		{
+			name:         "Allows v1 update when DSC does not exist (create scenario)",
+			existingObjs: []client.Object{},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Update,
+				envtestutil.NewDSCV1("test-dsc-nonexistent", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: true,
+		},
+		{
+			name: "Denies v1 create when another DSC exists (singleton check)",
+			existingObjs: []client.Object{
+				envtestutil.NewDSC("existing-dsc", func(dsc *dscv2.DataScienceCluster) {
+					dsc.Spec.Components.Trainer.ManagementState = operatorv1.Managed
+				}),
+			},
+			req: envtestutil.NewAdmissionRequest(t, admissionv1.Create,
+				envtestutil.NewDSCV1("new-dsc", func(dsc *dscv1.DataScienceCluster) {
+					dsc.Spec.Components.Dashboard.ManagementState = operatorv1.Managed
+				}),
+				gvk.DataScienceClusterV1, gvr),
+			allowed: false, // Will be denied by singleton check, not v2 component check
 		},
 	}
 

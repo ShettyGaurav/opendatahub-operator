@@ -915,6 +915,7 @@ func NewAdmissionRequest(
 			UID:       "test-uid",
 			Kind:      metav1.GroupVersionKind{Group: kind.Group, Version: kind.Version, Kind: kind.Kind},
 			Resource:  resource,
+			Name:      obj.GetName(),
 			Namespace: obj.GetNamespace(),
 			Operation: op,
 			Object:    runtime.RawExtension{Raw: objBytes},
