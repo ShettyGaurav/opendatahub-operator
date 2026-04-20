@@ -1142,6 +1142,43 @@ func TestDeployDynamicOwnership_FallsBackToStaticOwnership(t *testing.T) {
 	g.Expect(sec.GetOwnerReferences()).Should(BeEmpty(), "Non-owned GVK should not have owner reference")
 }
 
+func newDashboardInstance(uid apimachinery.UID) *componentApi.Dashboard {
+	instance := &componentApi.Dashboard{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       componentApi.DashboardInstanceName,
+			UID:        uid,
+			Generation: 1,
+		},
+	}
+	instance.SetGroupVersionKind(gvk.Dashboard)
+	return instance
+}
+
+func newOwnerRefReconciliationRequest(cl client.Client, instance *componentApi.Dashboard) types.ReconciliationRequest {
+	return types.ReconciliationRequest{
+		Client:   cl,
+		Instance: instance,
+		Release: common.Release{
+			Name: cluster.OpenDataHub,
+			Version: version.OperatorVersion{Version: semver.Version{
+				Major: 1, Minor: 2, Patch: 3,
+			}},
+		},
+		Controller: mocks.NewMockController(func(m *mocks.MockController) {
+			m.On("Owns", gvk.ConfigMap).Return(true)
+		}),
+	}
+}
+
+func assertControllerOwnerRef(g Gomega, ownerRefs []metav1.OwnerReference, instance *componentApi.Dashboard, msgAndArgs ...interface{}) {
+	g.Expect(ownerRefs).Should(HaveLen(1), msgAndArgs...)
+	g.Expect(ownerRefs[0].Kind).Should(Equal(gvk.Dashboard.Kind), msgAndArgs...)
+	g.Expect(ownerRefs[0].Name).Should(Equal(instance.Name), msgAndArgs...)
+	g.Expect(ownerRefs[0].UID).Should(Equal(instance.UID), msgAndArgs...)
+	g.Expect(*ownerRefs[0].Controller).Should(BeTrue(), msgAndArgs...)
+	g.Expect(*ownerRefs[0].BlockOwnerDeletion).Should(BeTrue(), msgAndArgs...)
+}
+
 func TestDeployStripsTemplateOwnerReferences(t *testing.T) {
 	g := NewWithT(t)
 
@@ -1154,16 +1191,8 @@ func TestDeployStripsTemplateOwnerReferences(t *testing.T) {
 	err = cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	g.Expect(err).ShouldNot(HaveOccurred())
 
-	instance := &componentApi.Dashboard{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       componentApi.DashboardInstanceName,
-			UID:        "test-uid-12345",
-			Generation: 1,
-		},
-	}
-	instance.SetGroupVersionKind(gvk.Dashboard)
+	instance := newDashboardInstance("test-uid-12345")
 
-	// Simulate a template-rendered ConfigMap that already has ownerReferences
 	templateOwnerRef := metav1.OwnerReference{
 		APIVersion: gvk.Dashboard.GroupVersion().String(),
 		Kind:       gvk.Dashboard.Kind,
@@ -1184,20 +1213,8 @@ func TestDeployStripsTemplateOwnerReferences(t *testing.T) {
 	})
 	g.Expect(err).ShouldNot(HaveOccurred())
 
-	rr := types.ReconciliationRequest{
-		Client:   cl,
-		Instance: instance,
-		Release: common.Release{
-			Name: cluster.OpenDataHub,
-			Version: version.OperatorVersion{Version: semver.Version{
-				Major: 1, Minor: 2, Patch: 3,
-			}},
-		},
-		Resources: []unstructured.Unstructured{*configMap},
-		Controller: mocks.NewMockController(func(m *mocks.MockController) {
-			m.On("Owns", gvk.ConfigMap).Return(true)
-		}),
-	}
+	rr := newOwnerRefReconciliationRequest(cl, instance)
+	rr.Resources = []unstructured.Unstructured{*configMap}
 
 	action := deploy.NewAction(deploy.WithMode(deploy.ModePatch))
 	err = action(ctx, &rr)
@@ -1207,16 +1224,159 @@ func TestDeployStripsTemplateOwnerReferences(t *testing.T) {
 	err = cl.Get(ctx, apimachinery.NamespacedName{Namespace: ns, Name: "test-cm"}, cm)
 	g.Expect(err).ShouldNot(HaveOccurred())
 
-	// Verify exactly one ownerReference set by SetControllerReference
-	// (with controller=true), NOT the template-defined one (without controller field).
-	ownerRefs := cm.GetOwnerReferences()
-	g.Expect(ownerRefs).Should(HaveLen(1))
-	g.Expect(ownerRefs[0].Kind).Should(Equal(gvk.Dashboard.Kind))
-	g.Expect(ownerRefs[0].Name).Should(Equal(instance.Name))
-	g.Expect(ownerRefs[0].UID).Should(Equal(instance.UID))
-	g.Expect(*ownerRefs[0].Controller).Should(BeTrue(),
-		"ownerReference should be a controller reference set by SetControllerReference, not a template-defined one")
-	g.Expect(*ownerRefs[0].BlockOwnerDeletion).Should(BeTrue())
+	assertControllerOwnerRef(g, cm.GetOwnerReferences(), instance)
+}
+
+func TestDeployStripsTemplateOwnerReferences_RepeatedReconciliation(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+	ns := xid.New().String()
+
+	cl, err := fakeclient.New()
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	err = cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	instance := newDashboardInstance("test-uid-12345")
+
+	templateOwnerRef := metav1.OwnerReference{
+		APIVersion: gvk.Dashboard.GroupVersion().String(),
+		Kind:       gvk.Dashboard.Kind,
+		Name:       instance.Name,
+		UID:        instance.UID,
+	}
+
+	action := deploy.NewAction(deploy.WithMode(deploy.ModePatch))
+
+	for i := range 2 {
+		configMap, err := resources.ToUnstructured(&corev1.ConfigMap{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "ConfigMap",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "test-cm",
+				Namespace:       ns,
+				OwnerReferences: []metav1.OwnerReference{templateOwnerRef},
+			},
+		})
+		g.Expect(err).ShouldNot(HaveOccurred())
+
+		rr := newOwnerRefReconciliationRequest(cl, instance)
+		rr.Resources = []unstructured.Unstructured{*configMap}
+
+		err = action(ctx, &rr)
+		g.Expect(err).ShouldNot(HaveOccurred(), "reconciliation %d should not fail", i+1)
+
+		cm := resources.GvkToUnstructured(gvk.ConfigMap)
+		err = cl.Get(ctx, apimachinery.NamespacedName{Namespace: ns, Name: "test-cm"}, cm)
+		g.Expect(err).ShouldNot(HaveOccurred())
+
+		assertControllerOwnerRef(g, cm.GetOwnerReferences(), instance,
+			"reconciliation %d: unexpected ownerReferences", i+1)
+	}
+}
+
+func TestDeployStripsTemplateOwnerReferences_ForeignOwner(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+	ns := xid.New().String()
+
+	cl, err := fakeclient.New()
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	err = cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	instance := newDashboardInstance("dashboard-uid-12345")
+
+	// Template ownerRef pointing to a different resource (DataScienceCluster),
+	// simulating the actual bug where a template ownerRef points to a parent
+	// resource rather than the component controller.
+	foreignOwnerRef := metav1.OwnerReference{
+		APIVersion: gvk.DataScienceCluster.GroupVersion().String(),
+		Kind:       gvk.DataScienceCluster.Kind,
+		Name:       "default-dsc",
+		UID:        "dsc-uid-99999",
+	}
+
+	configMap, err := resources.ToUnstructured(&corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cm",
+			Namespace:       ns,
+			OwnerReferences: []metav1.OwnerReference{foreignOwnerRef},
+		},
+	})
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	rr := newOwnerRefReconciliationRequest(cl, instance)
+	rr.Resources = []unstructured.Unstructured{*configMap}
+
+	action := deploy.NewAction(deploy.WithMode(deploy.ModePatch))
+	err = action(ctx, &rr)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	cm := resources.GvkToUnstructured(gvk.ConfigMap)
+	err = cl.Get(ctx, apimachinery.NamespacedName{Namespace: ns, Name: "test-cm"}, cm)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	assertControllerOwnerRef(g, cm.GetOwnerReferences(), instance,
+		"ownerReference should point to Dashboard, not DataScienceCluster")
+}
+
+func TestDeployStripsTemplateOwnerReferences_SSAMode(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+
+	et, err := envt.New()
+	g.Expect(err).NotTo(HaveOccurred())
+	t.Cleanup(func() { _ = et.Stop() })
+
+	cl := et.Client()
+	ns := xid.New().String()
+	g.Expect(cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+	instance := newDashboardInstance("")
+	g.Expect(cl.Create(ctx, instance)).To(Succeed())
+
+	templateOwnerRef := metav1.OwnerReference{
+		APIVersion: gvk.Dashboard.GroupVersion().String(),
+		Kind:       gvk.Dashboard.Kind,
+		Name:       instance.Name,
+		UID:        instance.UID,
+	}
+
+	rr := newOwnerRefReconciliationRequest(cl, instance)
+
+	action := deploy.NewAction()
+
+	// Run two reconciliation cycles with the same template ownerRef present each time.
+	// The second cycle validates that SSA doesn't re-detect the (already correct) ownerRef
+	// as drift, which was the root cause of the infinite reconciliation loop.
+	for i := range 2 {
+		rr.Resources = nil
+		g.Expect(rr.AddResources(&corev1.ConfigMap{
+			TypeMeta:   metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cm", Namespace: ns, OwnerReferences: []metav1.OwnerReference{templateOwnerRef}},
+		})).To(Succeed())
+
+		err = action(ctx, &rr)
+		g.Expect(err).ShouldNot(HaveOccurred(), "reconciliation %d should not fail", i+1)
+
+		cm := &corev1.ConfigMap{}
+		g.Expect(cl.Get(ctx, apimachinery.NamespacedName{Namespace: ns, Name: "test-cm"}, cm)).To(Succeed())
+
+		assertControllerOwnerRef(g, cm.GetOwnerReferences(), instance,
+			"reconciliation %d: unexpected ownerReferences", i+1)
+	}
 }
 
 func TestDeployDynamicOwnership_CRDsExcludedByDefault(t *testing.T) {

@@ -32,6 +32,7 @@ import (
 	dsciv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/dscinitialization/v2"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/operatorconfig"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/testf"
@@ -101,6 +102,14 @@ func NewTestContext(t *testing.T) (*TestContext, error) { //nolint:thelper
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Initialize the cluster config for detecting the platform
+	err = cluster.Init(t.Context(), tcf.Client(), operatorconfig.OperatorSettings{
+		OperatorNamespace: testOpts.operatorNamespace,
+	})
+	if err != nil {
+		t.Logf("Warning: cluster.Init failed: %v", err)
 	}
 
 	// Set up the global debug client for panic handling
@@ -1389,6 +1398,11 @@ func (tc *TestContext) FetchClusterVersion() *configv1.ClusterVersion {
 // Returns:
 //   - common.Platform: The platform release name retrieved from the DSCInitialization resource.
 func (tc *TestContext) FetchPlatformRelease() common.Platform {
+	// In XKS platform (KinD), the platform release name is XKS
+	if tc.IsXKS() {
+		return cluster.XKS
+	}
+
 	// Fetch the DSCInitialization object
 	dsci := tc.FetchDSCInitialization()
 
@@ -1406,6 +1420,11 @@ func (tc *TestContext) FetchPlatformRelease() common.Platform {
 // Returns:
 //   - *dsciv2.DSCInitialization: The retrieved DSCInitialization object.
 func (tc *TestContext) FetchDSCInitialization() *dsciv2.DSCInitialization {
+	// In XKS, DSCInitialization does not exist
+	if tc.IsXKS() {
+		return nil
+	}
+
 	// Ensure the DSCInitialization exists and retrieve the object
 	dsci := &dsciv2.DSCInitialization{}
 	tc.FetchTypedResource(dsci, WithMinimalObject(gvk.DSCInitialization, tc.DSCInitializationNamespacedName))
@@ -1421,6 +1440,11 @@ func (tc *TestContext) FetchDSCInitialization() *dsciv2.DSCInitialization {
 // Returns:
 //   - *dsciv2.DataScienceCluster: The retrieved DataScienceCluster object.
 func (tc *TestContext) FetchDataScienceCluster() *dscv2.DataScienceCluster {
+	// In XKS, DataScienceCluster does not exist
+	if tc.IsXKS() {
+		return nil
+	}
+
 	// Ensure the DataScienceCluster exists and retrieve the object
 	dsc := &dscv2.DataScienceCluster{}
 	tc.FetchTypedResource(dsc, WithMinimalObject(gvk.DataScienceCluster, tc.DataScienceClusterNamespacedName))
@@ -1428,20 +1452,21 @@ func (tc *TestContext) FetchDataScienceCluster() *dscv2.DataScienceCluster {
 	return dsc
 }
 
-// IsOpenshift checks if the cluster is Openshift or not
+// IsXKS checks if the platform is XKS (External Kubernetes Service)
 //
 //	Returns:
-//	  - bool: True if the cluster is Openshift, false otherwise.
-func (tc *TestContext) IsOpenshift() bool {
-	return cluster.GetClusterInfo().Type != cluster.ClusterTypeKubernetes
+//	  - bool: True if the platform is XKS, false otherwise.
+func (tc *TestContext) IsXKS() bool {
+	// In XKS platform (KinD), the cluster type is Kubernetes
+	return cluster.GetClusterInfo().Type == cluster.ClusterTypeKubernetes
 }
 
-// SkipIfNonOpenshiftCluster is used to skip a test if the cluster where its being executed is non-Openshift.
-func (tc *ComponentTestCtx) SkipIfNonOpenshiftCluster(t *testing.T) {
+// SkipIfXKSCluster is used to skip a test if the platform where its being executed is XKS.
+func (tc *TestContext) SkipIfXKSCluster(t *testing.T) {
 	t.Helper()
 
-	if !tc.IsOpenshift() {
-		t.Skip("Skipping test because it requires an OpenShift cluster")
+	if tc.IsXKS() {
+		t.Skip("Skipping test because it is not supported on XKS platform")
 	}
 }
 
@@ -1513,15 +1538,20 @@ func (tc *TestContext) ApproveInstallPlan(plan *ofapi.InstallPlan) {
 	// Prepare the InstallPlan object to be approved
 	obj := tc.createInstallPlan(plan.Name, plan.Namespace, plan.Spec.ClusterServiceVersionNames)
 
-	// Set up patch options
-	force := true
-	opt := &client.PatchOptions{
-		FieldManager: dscInstanceName,
-		Force:        &force,
+	// Convert InstallPlan to unstructured and use new Apply API
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		tc.g.Expect(err).NotTo(HaveOccurred(), "Failed to convert InstallPlan to unstructured: %v", err)
+		return
 	}
+	unstrObj := &unstructured.Unstructured{Object: u}
 
-	// Apply the patch to approve the InstallPlan
-	err := tc.Client().Patch(tc.Context(), obj, client.Apply, opt) //nolint:staticcheck // TODO: migrate to cli.Apply() with client.ApplyOption
+	// Apply using new client.Apply API with typed options
+	err = tc.Client().Apply(tc.Context(),
+		client.ApplyConfigurationFromUnstructured(unstrObj),
+		client.FieldOwner(dscInstanceName),
+		client.ForceOwnership,
+	)
 	tc.g.Expect(err).
 		NotTo(
 			HaveOccurred(),
